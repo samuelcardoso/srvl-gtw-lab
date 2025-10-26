@@ -1,53 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# arns
-ARN_CREATE=$(awslocal lambda get-function --function-name createMessage     --query 'Configuration.FunctionArn' --output text)
-ARN_LIST=$(awslocal   lambda get-function --function-name listConversation   --query 'Configuration.FunctionArn' --output text)
+# Usa awslocal, ou aws apontando para o LocalStack
+AWSL=$(command -v awslocal >/dev/null 2>&1 && echo "awslocal" || echo "aws --endpoint-url=http://localhost:4566")
 
-# API
-API_ID=$(awslocal apigatewayv2 create-api \
-  --name chat-api \
-  --protocol-type HTTP \
-  --cors-configuration AllowOrigins='*',AllowMethods='GET,POST,OPTIONS' \
-  --query 'ApiId' --output text)
+# ARNs das Lambdas
+ARN_CREATE=$($AWSL lambda get-function --function-name createMessage    --query 'Configuration.FunctionArn' --output text)
+ARN_LIST=$($AWSL   lambda get-function --function-name listConversation --query 'Configuration.FunctionArn' --output text)
 
-# integrações
-INT_CREATE=$(awslocal apigatewayv2 create-integration \
-  --api-id $API_ID --integration-type AWS_PROXY \
-  --integration-uri $ARN_CREATE --payload-format-version 2.0 \
-  --integration-method POST --query 'IntegrationId' --output text)
+# ===== API GATEWAY v1 (REST API) =====
 
-INT_LIST=$(awslocal apigatewayv2 create-integration \
-  --api-id $API_ID --integration-type AWS_PROXY \
-  --integration-uri $ARN_LIST --payload-format-version 2.0 \
-  --integration-method POST --query 'IntegrationId' --output text)
+# 1) Cria API
+REST_ID=$($AWSL apigateway create-rest-api --name chat-api --query id --output text)
 
-# rotas
-awslocal apigatewayv2 create-route --api-id $API_ID \
-  --route-key "POST /conversations/{id}/messages" \
-  --target "integrations/$INT_CREATE"
+# 2) Cria recursos /conversations/{id}/messages
+ROOT_ID=$($AWSL apigateway get-resources --rest-api-id "$REST_ID" --query 'items[?path==`/`].id' --output text)
+RES_CONV=$($AWSL apigateway create-resource --rest-api-id "$REST_ID" --parent-id "$ROOT_ID" --path-part 'conversations' --query id --output text)
+RES_ID=$($AWSL   apigateway create-resource --rest-api-id "$REST_ID" --parent-id "$RES_CONV" --path-part '{id}'        --query id --output text)
+RES_MSG=$($AWSL  apigateway create-resource --rest-api-id "$REST_ID" --parent-id "$RES_ID"  --path-part 'messages'     --query id --output text)
 
-awslocal apigatewayv2 create-route --api-id $API_ID \
-  --route-key "GET /conversations/{id}/messages" \
-  --target "integrations/$INT_LIST"
+# 3) Métodos e integrações (Lambda Proxy)
+$AWSL apigateway put-method \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method POST --authorization-type "NONE"
 
-# permissões
-awslocal lambda add-permission \
+$AWSL apigateway put-integration \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method POST \
+  --type AWS_PROXY --integration-http-method POST \
+  --uri "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/$ARN_CREATE/invocations"
+
+$AWSL apigateway put-method \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method GET --authorization-type "NONE"
+
+$AWSL apigateway put-integration \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method GET \
+  --type AWS_PROXY --integration-http-method POST \
+  --uri "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/$ARN_LIST/invocations"
+
+# 3.1) OPTIONS para CORS (MOCK)
+$AWSL apigateway put-method \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method OPTIONS --authorization-type "NONE"
+
+$AWSL apigateway put-method-response \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method OPTIONS --status-code 200 \
+  --response-parameters "method.response.header.Access-Control-Allow-Origin=true,method.response.header.Access-Control-Allow-Methods=true,method.response.header.Access-Control-Allow-Headers=true"
+
+$AWSL apigateway put-integration \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method OPTIONS --type MOCK \
+  --request-templates '{"application/json":"{\"statusCode\": 200}"}'
+
+$AWSL apigateway put-integration-response \
+  --rest-api-id "$REST_ID" --resource-id "$RES_MSG" --http-method OPTIONS --status-code 200 \
+  --response-parameters "method.response.header.Access-Control-Allow-Origin='*',method.response.header.Access-Control-Allow-Methods='GET,POST,OPTIONS',method.response.header.Access-Control-Allow-Headers='*'"
+
+# 4) Permissões para API GW invocar as Lambdas
+$AWSL lambda add-permission \
   --function-name createMessage --statement-id apigw1 \
   --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:us-east-1:000000000000:$API_ID/*/*/conversations/*/messages"
+  --source-arn "arn:aws:execute-api:us-east-1:000000000000:$REST_ID/*/POST/conversations/*/messages"
 
-awslocal lambda add-permission \
+$AWSL lambda add-permission \
   --function-name listConversation --statement-id apigw2 \
   --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:us-east-1:000000000000:$API_ID/*/*/conversations/*/messages"
+  --source-arn "arn:aws:execute-api:us-east-1:000000000000:$REST_ID/*/GET/conversations/*/messages"
 
-# stage
-awslocal apigatewayv2 create-stage --api-id $API_ID --stage-name dev --auto-deploy
+# 5) Deploy (stage dev)
+$AWSL apigateway create-deployment --rest-api-id "$REST_ID" --stage-name dev >/dev/null
 
-# endpoint
-BASE=$(awslocal apigatewayv2 get-apis --query "Items[?Name=='chat-api'].ApiEndpoint" --output text)/dev
+# 6) Endpoint base (REST API no LocalStack)
+BASE="http://$REST_ID.execute-api.localhost.localstack.cloud:4566/dev"
 echo "API base: $BASE"
-# exporta para arquivo para outros scripts
 echo "BASE=$BASE" > .apibase.env

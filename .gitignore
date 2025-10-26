@@ -1,0 +1,11 @@
+# Node
+**/node_modules/*
+**/dist/*
+**/package-lock.json
+
+# Misc
+.apibase.env
+
+# Zips
+create.zip
+list.zip
